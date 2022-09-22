@@ -2,6 +2,7 @@ import datetime
 import json
 import logging
 import os
+import pickle
 import random
 import shutil
 from pathlib import Path
@@ -18,6 +19,7 @@ from config import *
 from utils import *
 
 os.environ["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 app = Flask(__name__)
 app.config.from_object(APP_SETTINGS)
@@ -119,7 +121,7 @@ def upload_transcript():
         # logger.info("Annotating video with OpenFace...")
         # res = openfaceExtractor.get_annotated_video(str(video_path), str(annotated_video_path))
         # logger.debug(res) # BUG: OpenFace won't set return code >0 on error
-        # logger.info("Annotation done.")    
+        # logger.info("Annotation done.")
     except Exception as e:
         logger.exception(e)
         return {"code": ERROR_CODE, "msg": str(e)}
@@ -135,6 +137,8 @@ def edit_video_aligned():
         raw_video_path = MEDIA_PATH / video_id / "raw_video.mp4"
         modified_video_path = MEDIA_PATH / video_id / "modified_video.mp4"
         modified_video_tmp = MEDIA_PATH / video_id / "modified_video_tmp.mp4"
+        video_edit_file = MEDIA_PATH / video_id / "edit_video.json"
+        audio_edit_file = MEDIA_PATH / video_id / "edit_audio.json"
         shutil.copyfile(raw_video_path, modified_video_path)
         with open(MEDIA_PATH / video_id / "aligned_results.json") as f:
             aligned_results = json.load(f)
@@ -151,6 +155,11 @@ def edit_video_aligned():
                     audio_modify.append([word[0], word[2], word[3]])
             elif word[1] == 't':
                 text_modify.append([word[0], word[2], word[3]])
+        # dump edit to files, to be used by feature interpolation
+        with open(video_edit_file, 'w') as f:
+            json.dump(video_modify, f)
+        with open(audio_edit_file, 'w') as f:
+            json.dump(audio_modify, f)
         # edit video
         if len(video_modify) > 0:
             logger.info("Editing video...")
@@ -187,7 +196,7 @@ def edit_video_aligned():
                     start = aligned_results[word_id]['start']
                     end = aligned_results[word_id]['end']
                     if i != 0:
-                        cmd += f'[v{i-1}]'
+                        cmd += f'[a{i-1}]'
                     cmd += f"volume=enable='between(t,{start},{end})':volume=0[a{i}];"
             cmd = cmd[:-1] + f"\" -map 0:v -map \"[a{len(audio_modify)-1}]\" -c:v copy -y {modified_video_tmp}"
             logger.debug(cmd)
@@ -218,7 +227,7 @@ def edit_video_aligned():
             if t[1] == 'replace':
                 aligned_results[word_id]['word'] = t[2]
             elif t[1] == 'remove':
-                aligned_results[word_id]['word'] = '[UNK]' # ???
+                aligned_results[word_id]['word'] = '啊' # [UNK]
         transcript = " ".join([w['text'] for w in aligned_results])
         with open(MEDIA_PATH / video_id / "transcript_modified.txt", 'w') as f:
             f.write(transcript)
@@ -237,30 +246,30 @@ def run_msa_aligned():
         video_id = data['videoID']
         models = data['models']
         defence = data['defence']
-        video_original = MEDIA_PATH / video_id / "raw_video.mp4"
-        video_modified = MEDIA_PATH / video_id / "modified_video.mp4"
-        video_defended = MEDIA_PATH / video_id / "defended_video.mp4"
-        feat_original = MEDIA_PATH / video_id / "feat_original.pkl"
-        feat_modified = MEDIA_PATH / video_id / "feat_modified.pkl"
-        feat_defended = MEDIA_PATH / video_id / "feat_defended.pkl"
-        trans_original = MEDIA_PATH / video_id / "transcript.txt"
-        trans_modified = MEDIA_PATH / video_id / "transcript_modified.txt"
-        weights_root = Path(__file__).parent / "assets" / "weights"
-        
+        video_original_path = MEDIA_PATH / video_id / "raw_video.mp4"
+        video_modified_path = MEDIA_PATH / video_id / "modified_video.mp4"
+        video_defended_path = MEDIA_PATH / video_id / "defended_video.mp4"
+        feat_original_path = MEDIA_PATH / video_id / "feat_original.pkl"
+        feat_modified_path = MEDIA_PATH / video_id / "feat_modified.pkl"
+        feat_defended_path = MEDIA_PATH / video_id / "feat_defended.pkl"
+        trans_original_path = MEDIA_PATH / video_id / "transcript.txt"
+        trans_modified_path = MEDIA_PATH / video_id / "transcript_modified.txt"
+        weights_root_path = Path(__file__).parent / "assets" / "weights"
         # data defence
-        logger.info("Data-level Defence...")
-        data_defence(video_id, defence)
-        # original
+        logger.info("Data-Level Defence...")
+        data_defended = data_defence(video_id, defence)
+        # extract original features
         logger.info("Extracting features from original video...")
-        f_original = FET.run_single(video_original, feat_original, text_file=trans_original)
-        # modified
-        logger.info("Extracting features from defended video...")
-        f_defended = FET.run_single(video_defended, feat_modified, text_file=trans_modified)
-        # feature defence
-        logger.info("Feature-level Defence...")
-        feature_defence(video_id, defence)
-        # explain features
-        word_ids_original = get_word_ids(trans_original, BERT_TOKENIZER)
+        f_original = FET.run_single(video_original_path, feat_original_path, text_file=trans_original_path)
+        # extract modified features
+        logger.info("Extracting features from modified video...")
+        f_modified = FET.run_single(video_modified_path, feat_modified_path, text_file=trans_modified_path)
+        # extract defended features
+        if data_defended:
+            logger.info("Extracting features from defended video...")
+            FET.run_single(video_defended_path, feat_defended_path, text_file=trans_modified_path)
+        # explain original features
+        word_ids_original = get_word_ids(trans_original_path, BERT_TOKENIZER)
         last_word_id = -1
         remove_ids = []
         for i, v in enumerate(word_ids_original):
@@ -272,19 +281,27 @@ def run_msa_aligned():
         for m in ['audio', 'vision', 'text']:
             f_original[m] = np.delete(f_original[m], remove_ids, axis=0) # remove repeated feature
             f_original[m] = f_original[m][1:-1] # remove start and end token
-        
-        word_ids_modified = get_word_ids(trans_modified, BERT_TOKENIZER)
+        # explain modified & defended features
+        word_ids_modified = get_word_ids(trans_modified_path, BERT_TOKENIZER)
+        # feature defence
+        logger.info("Feature-Level Defence...")
+        feature_defended = feature_defence(video_id, defence, data_defended, word_ids_modified)
         last_word_id = -1
         remove_ids = []
         for i, v in enumerate(word_ids_modified):
-            if v is None:
+            if v is None: # start or end token
                 continue
-            if v == last_word_id:
+            if v == last_word_id: # same word, multiple tokens
                 remove_ids.append(i)
             last_word_id = v
-        for m in ['audio', 'vision', 'text']:
-            f_defended[m] = np.delete(f_defended[m], remove_ids, axis=0)
-            f_defended[m] = f_defended[m][1:-1]
+        for m in ['audio', 'vision']:
+            f_modified[m] = np.delete(f_modified[m], remove_ids, axis=0)
+            f_modified[m] = f_modified[m][1:-1]
+            if data_defended or feature_defended:
+                with open(feat_defended_path, "rb") as f:
+                    f_defended = pickle.load(f)
+                f_defended[m] = np.delete(f_defended[m], remove_ids, axis=0)
+                f_defended[m] = f_defended[m][1:-1]
         
         feat = {
             "original": {
@@ -318,6 +335,38 @@ def run_msa_aligned():
                 "AU45_r": f_original['vision'][:, -19].tolist(),
             },
             "modified": {
+                "loudness": f_modified['audio'][:, 0].tolist(),
+                "alphaRatio": f_modified['audio'][:, 1].tolist(),
+                "mfcc1": f_modified['audio'][:, 6].tolist(),
+                "mfcc2": f_modified['audio'][:, 7].tolist(),
+                "mfcc3": f_modified['audio'][:, 8].tolist(),
+                "mfcc4": f_modified['audio'][:, 9].tolist(),
+                "pitch": f_modified['audio'][:, 10].tolist(),
+                "HNR": f_modified['audio'][:, 13].tolist(),
+                "F1frequency": f_modified['audio'][:, 16].tolist(),
+                "F1bandwidth": f_modified['audio'][:, 17].tolist(),
+                "F1amplitude": f_modified['audio'][:, 18].tolist(),
+                "AU01_r": f_modified['vision'][:, -35].tolist(),
+                "AU02_r": f_modified['vision'][:, -34].tolist(),
+                "AU04_r": f_modified['vision'][:, -33].tolist(),
+                "AU05_r": f_modified['vision'][:, -32].tolist(),
+                "AU06_r": f_modified['vision'][:, -31].tolist(),
+                "AU07_r": f_modified['vision'][:, -30].tolist(),
+                "AU09_r": f_modified['vision'][:, -29].tolist(),
+                "AU10_r": f_modified['vision'][:, -28].tolist(),
+                "AU12_r": f_modified['vision'][:, -27].tolist(),
+                "AU14_r": f_modified['vision'][:, -26].tolist(),
+                "AU15_r": f_modified['vision'][:, -25].tolist(),
+                "AU17_r": f_modified['vision'][:, -24].tolist(),
+                "AU20_r": f_modified['vision'][:, -23].tolist(),
+                "AU23_r": f_modified['vision'][:, -22].tolist(),
+                "AU25_r": f_modified['vision'][:, -21].tolist(),
+                "AU26_r": f_modified['vision'][:, -20].tolist(),
+                "AU45_r": f_modified['vision'][:, -19].tolist(),
+            }
+        }
+        if data_defended or feature_defended:
+            feat['defended'] = {
                 "loudness": f_defended['audio'][:, 0].tolist(),
                 "alphaRatio": f_defended['audio'][:, 1].tolist(),
                 "mfcc1": f_defended['audio'][:, 6].tolist(),
@@ -347,19 +396,23 @@ def run_msa_aligned():
                 "AU26_r": f_defended['vision'][:, -20].tolist(),
                 "AU45_r": f_defended['vision'][:, -19].tolist(),
             }
-        }
         # run MSA models
         logger.info("Running MSA models...")
         res = {
             "original": {},
-            "modified": {}
+            "modified": {},
         }
+        if data_defended or feature_defended:
+            res["defended"] = {}
         for m in models:
             config = get_config_regression(m, "mosei")
-            r = MMSA_test(config, weights_root / f"{m}-mosei.pth", feat_original, gpu_id=3)
+            r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_original_path, gpu_id=3)
             res["original"][m] = float(r)
-            r = MMSA_test(config, weights_root / f"{m}-mosei.pth", feat_defended, gpu_id=3)
+            r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_modified_path, gpu_id=3)
             res["modified"][m] = float(r)
+            if data_defended or feature_defended:
+                r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_modified_path, gpu_id=3)
+                res["defended"][m] = float(r)
 
     except Exception as e:
         logger.exception(e)

@@ -1,4 +1,6 @@
+import json
 import logging
+import pickle
 import shutil
 import subprocess
 from logging.handlers import RotatingFileHandler
@@ -42,7 +44,7 @@ def init_logger():
     return logger
 
 def clear_media_folder():
-    logger = logging.getLogger("app")
+    logger = logging.getLogger()
     logger.info("Cleaning temp files...")
     for path in MEDIA_PATH.glob("**/*"):
         if path.is_file():
@@ -124,30 +126,91 @@ def do_alignment(
     except Exception as e:
         raise e
 
-def data_defence(video_id : str, defence_methods: list[str]) -> None:
+def data_defence(video_id: str, defence_methods: list[str]) -> bool:
+    logger = logging.getLogger()
     modified_video_path = MEDIA_PATH / video_id / "modified_video.mp4"
     defended_video_path = MEDIA_PATH / video_id / "defended_video.mp4"
     defended_video_tmp = MEDIA_PATH / video_id / "defended_video_tmp.mp4"
+    defended = False
     shutil.copyfile(modified_video_path, defended_video_path)
     for method in defence_methods:
         if method == "a_denoise":
+            logger.info("Audio Denoising...")
             cmd = f"ffmpeg -i {defended_video_path} -af afftdn=nr=40:nf=-20:tn=1 -c:v copy -y {defended_video_tmp}"
             execute_cmd(cmd)
             shutil.copyfile(defended_video_tmp, defended_video_path)
             defended_video_tmp.unlink()
+            defended = True
         elif method == "v_reconstruct":
+            logger.info("Video MCI...")
             cmd = f"ffmpeg -i {defended_video_path} -vf blackframe=0,metadata=select:key=lavfi.blackframe.pblack:value=90:function=less,minterpolate=mi_mode=mci -c:a copy -y {defended_video_tmp}"
             execute_cmd(cmd)
             shutil.copyfile(defended_video_tmp, defended_video_path)
             defended_video_tmp.unlink()
+            defended = True
+    return defended
 
-def feature_defence(video_id : str, defence_methods : list[str]) -> None:
+def feature_defence(video_id: str, defence_methods: list[str], data_defended: bool, word_ids: list[int]) -> bool:
     modified_feature = MEDIA_PATH / video_id / "feat_modified.pkl"
     defended_feature = MEDIA_PATH / video_id / "feat_defended.pkl"
-    shutil.copyfile(modified_feature, defended_feature)
+    video_edit_file = MEDIA_PATH / video_id / "edit_video.json"
+    audio_edit_file = MEDIA_PATH / video_id / "edit_audio.json"
+    defended = False
+    if not data_defended:
+        shutil.copyfile(modified_feature, defended_feature)
     for method in defence_methods:
         if method == "f_interpol":
-            pass
+            need_vf_defend = False if "v_reconstruct" in defence_methods else True
+            with open(defended_feature, "rb") as f:
+                feat = pickle.load(f)
+            with open(video_edit_file, "r") as f:
+                video_edit = json.load(f)
+            with open(audio_edit_file, "r") as f:
+                audio_edit = json.load(f)
+            v_edit_ids = [v[0] for v in video_edit]
+            a_edit_ids = [a[0] for a in audio_edit]
+            v_edit_mask = []
+            a_edit_mask = []
+            for v in word_ids:
+                if v in v_edit_ids:
+                    v_edit_mask.append(1)
+                else:
+                    v_edit_mask.append(0)
+                if v in a_edit_ids:
+                    a_edit_mask.append(1)
+                else:
+                    a_edit_mask.append(0)
+            # audio interpolation
+            i, start_idx, end_idx = 0, -1, -1
+            while i < len(a_edit_mask):
+                if a_edit_mask[i] == 1:
+                    start_idx = i - 1
+                    while i < len(a_edit_mask) and a_edit_mask[i] == 1:
+                        i += 1
+                    end_idx = i
+                    start_f = feat['audio'][start_idx]
+                    end_f = feat['audio'][end_idx]
+                    delta = end_f - start_f
+                    for idx in range(1, end_idx - start_idx):
+                        feat['audio'][start_idx + idx] = start_f + delta * idx / float(end_idx - start_idx)
+                i += 1
+            # video interpolation
+            if need_vf_defend:
+                i, start_idx, end_idx = 0, -1, -1
+                while i < len(v_edit_mask):
+                    if v_edit_mask[i] == 1:
+                        start_idx = i - 1
+                        while i < len(v_edit_mask) and v_edit_mask[i] == 1:
+                            i += 1
+                        end_idx = i
+                        start_f = feat['vision'][start_idx]
+                        end_f = feat['vision'][end_idx]
+                        delta = end_f - start_f
+                        for idx in range(1, end_idx - start_idx):
+                            feat['vision'][start_idx + idx] = start_f + delta * idx / float(end_idx - start_idx)
+                    i += 1
+            defended = True
+    return defended
 
 def get_word_ids(text_file : str, tokenizer : BertTokenizerFast) -> list[int]:
     text = open(text_file, "r").read()
