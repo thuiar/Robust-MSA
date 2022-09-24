@@ -1,6 +1,7 @@
 import json
 import logging
 import pickle
+import shlex
 import shutil
 import subprocess
 from logging.handlers import RotatingFileHandler
@@ -8,11 +9,12 @@ from pathlib import Path
 from shutil import rmtree
 
 import ctc_segmentation
-import shlex
 import librosa
 import numpy as np
 import torch
-from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, Wav2Vec2Tokenizer, BertTokenizerFast
+from MMSA import get_config_regression
+from transformers import (BertTokenizerFast, Wav2Vec2ForCTC, Wav2Vec2Processor,
+                          Wav2Vec2CTCTokenizer)
 
 from config import *
 
@@ -62,10 +64,10 @@ def execute_cmd(cmd: str) -> bytes:
 
 def do_asr(
     audio_file : str | Path, 
-    processor : Wav2Vec2Processor,
-    model : Wav2Vec2ForCTC,
 ) -> str:
     try:
+        processor = Wav2Vec2Processor.from_pretrained(WAV2VEC_MODEL_NAME)
+        model = Wav2Vec2ForCTC.from_pretrained(WAV2VEC_MODEL_NAME).to(DEVICE)
         sample_rate = 16000
         audio, _ = librosa.load(audio_file, sr=sample_rate)
         features = processor(
@@ -86,11 +88,11 @@ def do_asr(
 def do_alignment(
     audio_file : str | Path, 
     transcript : str,
-    processor : Wav2Vec2Processor,
-    tokenizer : Wav2Vec2Tokenizer,
-    model : Wav2Vec2ForCTC,
 ) -> list[dict]:
     try:
+        processor = Wav2Vec2Processor.from_pretrained(WAV2VEC_MODEL_NAME)
+        model = Wav2Vec2ForCTC.from_pretrained(WAV2VEC_MODEL_NAME).to(DEVICE)
+        tokenizer = Wav2Vec2CTCTokenizer.from_pretrained(WAV2VEC_MODEL_NAME)
         audio, _ = librosa.load(audio_file, sr=16000)
         features = processor(
             audio, 
@@ -216,3 +218,156 @@ def get_word_ids(text_file : str, tokenizer : BertTokenizerFast) -> list[int]:
     text = open(text_file, "r").read()
     encoding = tokenizer(text.split(), is_split_into_words=True)
     return encoding.word_ids()
+
+def pad_or_truncate(feature_file : str, seq_len : int = 75) -> None:
+    with open(feature_file, "rb") as f:
+        data = pickle.load(f)
+    if data['audio'].shape[0] > seq_len:
+        # truncate to seq_len
+        data['audio'] = data['audio'][:seq_len]
+        data['vision'] = data['vision'][:seq_len]
+        data['text'] = data['text'][:seq_len]
+        data['text_bert'] = data['text_bert'][:, :seq_len]
+    elif data['audio'].shape[0] < seq_len:
+        # pad to seq_len
+        data['audio'] = np.pad(data['audio'], ((0, seq_len - data['audio'].shape[0]), (0, 0)), 'constant')
+        data['vision'] = np.pad(data['vision'], ((0, seq_len - data['vision'].shape[0]), (0, 0)), 'constant')
+        data['text'] = np.pad(data['text'], ((0, seq_len - data['text'].shape[0]), (0, 0)), 'constant')
+        data['text_bert'] = np.pad(data['text_bert'], ((0, 0), (0, seq_len - data['text_bert'].shape[1])), 'constant')
+    with open(feature_file, "wb") as f:
+        pickle.dump(data, f)
+
+def get_msa_config(model_name : str) -> dict:
+    config = get_config_regression(model_name, "mosei")
+    match model_name:
+        case 'tfn':
+            config.update({
+                'need_data_aligned': True,
+                'need_model_aligned': False,
+                'hidden_dims': [128, 32, 128], 
+                'text_out': 128, 
+                'post_fusion_dim': 64, 
+                'dropouts': [0.3, 0.3, 0.3, 0.5], 
+                'batch_size': 128, 
+                'learning_rate': 0.001, 
+            })
+        case 'lmf':
+            config.update({
+                'need_data_aligned': True,
+                'need_model_aligned': False,
+                'hidden_dims': [64, 32, 64], 
+                'dropouts': [0.3, 0.3, 0.3, 0.3], 
+                'rank': 3, 
+                'batch_size': 32, 
+                'learning_rate': 0.0005, 
+                'factor_lr': 0.0001, 
+                'weight_decay': 0.0001, 
+            })
+        case 'bert_mag':
+            config.update({
+                'need_data_aligned': True,
+                'need_model_aligned': False,
+                'batch_size': 32, 
+                'learning_rate': 1e-05, 
+                'beta_shift': 1, 
+                'dropout_prob': 0.1, 
+            })
+        case 'misa':
+            config.update({
+                'need_data_aligned': True,
+                'need_model_aligned': False,
+                'batch_size': 32, 
+                'learning_rate': 0.0001, 
+                'hidden_size': 256, 
+                'dropout': 0.5, 
+                'reverse_grad_weight': 1.0, 
+                'diff_weight': 0.1, 
+                'sim_weight': 0.5, 
+                'sp_weight': 1.0, 
+                'recon_weight': 1.0, 
+                'grad_clip': 0.8, 
+                'weight_decay': 0.002, 
+            })
+        case 'mult':
+            config.update({})
+        case 'mmim':
+            config.update({
+                'need_data_aligned': True,
+                'need_model_aligned': False,
+            })
+        case 'self_mm':
+            config.update({
+                'need_data_aligned': True,
+                'need_model_aligned': False,
+                'batch_size': 32, 
+                'learning_rate_bert': 5e-05, 
+                'learning_rate_audio': 0.001, 
+                'learning_rate_video': 0.001, 
+                'learning_rate_other': 0.001, 
+                'weight_decay_bert': 0.001, 
+                'weight_decay_audio': 0.0, 
+                'weight_decay_video': 0.001, 
+                'weight_decay_other': 0.001, 
+                'a_lstm_hidden_size': 16, 
+                'v_lstm_hidden_size': 32, 
+                'a_lstm_layers': 1, 
+                'v_lstm_layers': 1, 
+                'text_out': 768, 
+                'audio_out': 16, 
+                'video_out': 32, 
+                'a_lstm_dropout': 0.0, 
+                'v_lstm_dropout': 0.0, 
+                't_bert_dropout': 0.1, 
+                'post_fusion_dim': 64, 
+                'post_text_dim': 64, 
+                'post_audio_dim': 16, 
+                'post_video_dim': 16, 
+                'post_fusion_dropout': 0.0, 
+                'post_text_dropout': 0.0, 
+                'post_audio_dropout': 0.1, 
+                'post_video_dropout': 0.0, 
+                'H': 3.0, 
+            })
+        case 'tfr_net':
+            config.update({
+                'recloss_type': 'combine', 
+                'conv1d_kernel_size_l': 3, 
+                'conv1d_kernel_size_a': 3, 
+                'conv1d_kernel_size_v': 5, 
+                'text_dropout': 0.2, 
+                'attn_dropout': 0.4, 
+                'attn_dropout_a': 0.0, 
+                'attn_dropout_v': 0.1, 
+                'relu_dropout': 0.2, 
+                'embed_dropout': 0.2, 
+                'res_dropout': 0.0, 
+                'dst_feature_dim_nheads': [36, 6], 
+                'nlevels': 3, 
+                'trans_hid_t': 128, 
+                'trans_hid_t_drop': 0.3, 
+                'trans_hid_a': 48, 
+                'trans_hid_a_drop': 0.2, 
+                'trans_hid_v': 80, 
+                'trans_hid_v_drop': 0.2, 
+                'fusion_t_in': 32, 
+                'fusion_a_in': 40, 
+                'fusion_v_in': 36, 
+                'fusion_t_hid': 48, 
+                'fusion_a_hid': 48, 
+                'fusion_v_hid': 32, 
+                'fusion_gru_layers': 3, 
+                'fusion_drop': 0.1, 
+                'cls_hidden_dim': 128, 
+                'cls_dropout': 0.0, 
+                'batch_size': 48, 
+                'learning_rate_bert': 1e-05, 
+                'learning_rate_other': 0.002, 
+                'grad_clip': 0.8, 
+                'patience': 10, 
+                'weight_decay_bert': 0.0, 
+                'weight_decay_other': 0.001, 
+                'weight_gen_loss': [4e-06, 1e-06, 2e-06], 
+                'num_temporal_head': 25,
+                'without_generator': True,
+            })
+    return config

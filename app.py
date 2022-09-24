@@ -25,26 +25,6 @@ app = Flask(__name__)
 app.config.from_object(APP_SETTINGS)
 CORS(app, supports_credentials=True)
 
-WAV2VEC_PROCESSER = Wav2Vec2Processor.from_pretrained(WAV2VEC_MODEL_NAME)
-WAV2VEC_TOKENIZER = Wav2Vec2CTCTokenizer.from_pretrained(WAV2VEC_MODEL_NAME)
-WAV2VEC_MODEL = Wav2Vec2ForCTC.from_pretrained(WAV2VEC_MODEL_NAME).to(DEVICE)
-cfg = get_default_config('bert+opensmile+openface')
-cfg['text']['device'] = 'cuda:3'
-cfg['video']['fps'] = 30
-cfg['video']['args'] = {
-    "hogalign": False,
-    "simalign": False,
-    "nobadaligned": False,
-    "landmark_2D": True,
-    "landmark_3D": False,
-    "pdmparams": False,
-    "head_pose": False,
-    "action_units": True,
-    "gaze": False,
-    "tracked": False
-}
-FET = FeatureExtractionTool(cfg)
-BERT_TOKENIZER = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
 logger = logging.getLogger()
 
@@ -88,7 +68,7 @@ def call_ASR():
         logger.info("Extraction done.")
         # do ASR
         logger.info("Doing ASR...")
-        transcript = do_asr(audio_save_path, WAV2VEC_PROCESSER, WAV2VEC_MODEL)
+        transcript = do_asr(audio_save_path)
         logger.info("ASR done.")
     except Exception as e:
         logger.exception(e)
@@ -110,12 +90,10 @@ def upload_transcript():
             f.write(transcript)
         # do alignment
         logger.info("Doing alignment...")
-        aligned_results = do_alignment(audio_save_path, transcript, WAV2VEC_PROCESSER, WAV2VEC_TOKENIZER, WAV2VEC_MODEL)
+        # aligned_results = do_alignment(audio_save_path, transcript, WAV2VEC_PROCESSER, WAV2VEC_TOKENIZER, WAV2VEC_MODEL)
+        aligned_results = do_alignment(audio_save_path, transcript)
         with open(MEDIA_PATH / video_id / "aligned_results.json", 'w') as f:
             json.dump(aligned_results, f)
-        # new_transcript = " ".join([x['text'] for x in aligned_results])
-        # with open(text_save_path, 'w') as f:
-        #     f.write(new_transcript)
         logger.info("Alignment done.")
         # annotate video with OpenFace
         # logger.info("Annotating video with OpenFace...")
@@ -225,9 +203,9 @@ def edit_video_aligned():
         for t in text_modify:
             word_id = t[0]
             if t[1] == 'replace':
-                aligned_results[word_id]['word'] = t[2]
+                aligned_results[word_id]['text'] = t[2]
             elif t[1] == 'remove':
-                aligned_results[word_id]['word'] = '啊' # [UNK]
+                aligned_results[word_id]['text'] = '啊' # [UNK]
         transcript = " ".join([w['text'] for w in aligned_results])
         with open(MEDIA_PATH / video_id / "transcript_modified.txt", 'w') as f:
             f.write(transcript)
@@ -255,21 +233,39 @@ def run_msa_aligned():
         trans_original_path = MEDIA_PATH / video_id / "transcript.txt"
         trans_modified_path = MEDIA_PATH / video_id / "transcript_modified.txt"
         weights_root_path = Path(__file__).parent / "assets" / "weights"
+        # init
+        cfg = get_default_config('bert+opensmile+openface')
+        cfg['text']['device'] = 'cuda:3'
+        cfg['video']['fps'] = 30
+        cfg['video']['args'] = {
+            "hogalign": False,
+            "simalign": False,
+            "nobadaligned": False,
+            "landmark_2D": True,
+            "landmark_3D": False,
+            "pdmparams": False,
+            "head_pose": False,
+            "action_units": True,
+            "gaze": False,
+            "tracked": False
+        }
+        fet = FeatureExtractionTool(cfg)
+        bert_tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
         # data defence
         logger.info("Data-Level Defence...")
         data_defended = data_defence(video_id, defence)
         # extract original features
         logger.info("Extracting features from original video...")
-        f_original = FET.run_single(video_original_path, feat_original_path, text_file=trans_original_path)
+        f_original = fet.run_single(video_original_path, feat_original_path, text_file=trans_original_path)
         # extract modified features
         logger.info("Extracting features from modified video...")
-        f_modified = FET.run_single(video_modified_path, feat_modified_path, text_file=trans_modified_path)
+        f_modified = fet.run_single(video_modified_path, feat_modified_path, text_file=trans_modified_path)
         # extract defended features
         if data_defended:
             logger.info("Extracting features from defended video...")
-            FET.run_single(video_defended_path, feat_defended_path, text_file=trans_modified_path)
+            fet.run_single(video_defended_path, feat_defended_path, text_file=trans_modified_path)
         # explain original features
-        word_ids_original = get_word_ids(trans_original_path, BERT_TOKENIZER)
+        word_ids_original = get_word_ids(trans_original_path, bert_tokenizer)
         last_word_id = -1
         remove_ids = []
         for i, v in enumerate(word_ids_original):
@@ -282,7 +278,7 @@ def run_msa_aligned():
             f_original[m] = np.delete(f_original[m], remove_ids, axis=0) # remove repeated feature
             f_original[m] = f_original[m][1:-1] # remove start and end token
         # explain modified & defended features
-        word_ids_modified = get_word_ids(trans_modified_path, BERT_TOKENIZER)
+        word_ids_modified = get_word_ids(trans_modified_path, bert_tokenizer)
         # feature defence
         logger.info("Feature-Level Defence...")
         feature_defended = feature_defence(video_id, defence, data_defended, word_ids_modified)
@@ -404,14 +400,18 @@ def run_msa_aligned():
         }
         if data_defended or feature_defended:
             res["defended"] = {}
+        pad_or_truncate(feat_original_path, 75)
+        pad_or_truncate(feat_modified_path, 75)
+        if data_defended or feature_defended:
+            pad_or_truncate(feat_defended_path, 75)
         for m in models:
-            config = get_config_regression(m, "mosei")
+            config = get_msa_config(m)
             r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_original_path, gpu_id=3)
             res["original"][m] = float(r)
             r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_modified_path, gpu_id=3)
             res["modified"][m] = float(r)
             if data_defended or feature_defended:
-                r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_modified_path, gpu_id=3)
+                r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_defended_path, gpu_id=3)
                 res["defended"][m] = float(r)
 
     except Exception as e:
