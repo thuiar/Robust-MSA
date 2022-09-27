@@ -10,10 +10,9 @@ from pathlib import Path
 # import transformers
 from flask import Flask, request
 from flask_cors import CORS
-from MMSA import MMSA_test, get_config_regression
+from MMSA import MMSA_test
 from MSA_FET import FeatureExtractionTool, get_default_config
-from transformers import (Wav2Vec2CTCTokenizer, Wav2Vec2ForCTC,
-                          Wav2Vec2Processor, BertTokenizerFast)
+from transformers import BertTokenizerFast
 
 from config import *
 from utils import *
@@ -45,7 +44,8 @@ def upload_video():
         original_file = save_path / f"original_{file.filename}"
         file.save(original_file)
         # convert to mp4 using ffmpeg
-        logger.info("Converting video to mp4...")
+        logger.info(f"Uploaded video, ID: {video_id}")
+        logger.info(f"Converting video {video_id} to mp4...")
         cmd = f"ffmpeg -i {original_file} -c:v libx264 -c:a aac -y {save_path / 'raw_video.mp4'}"
         execute_cmd(cmd)
         logger.info("Conversion done.")
@@ -62,12 +62,12 @@ def call_ASR():
         video_file = Path(MEDIA_PATH) / video_id / "raw_video.mp4"
         # extract audio
         audio_save_path = Path(MEDIA_PATH) / video_id / "audio.wav"
-        logger.info("Extracting audio...")
+        logger.info(f"Extracting audio from {video_id}...")
         cmd = f"ffmpeg -i {video_file} -vn -acodec pcm_s16le -ac 1 -y {audio_save_path}"
         execute_cmd(cmd)
         logger.info("Extraction done.")
         # do ASR
-        logger.info("Doing ASR...")
+        logger.info(f"Running ASR for {video_id}...")
         transcript = do_asr(audio_save_path)
         logger.info("ASR done.")
     except Exception as e:
@@ -89,7 +89,7 @@ def upload_transcript():
         with open(text_save_path, 'w') as f:
             f.write(transcript)
         # do alignment
-        logger.info("Doing alignment...")
+        logger.info(f"Running alignment for {video_id}...")
         # aligned_results = do_alignment(audio_save_path, transcript, WAV2VEC_PROCESSER, WAV2VEC_TOKENIZER, WAV2VEC_MODEL)
         aligned_results = do_alignment(audio_save_path, transcript)
         with open(MEDIA_PATH / video_id / "aligned_results.json", 'w') as f:
@@ -140,7 +140,7 @@ def edit_video_aligned():
             json.dump(audio_modify, f)
         # edit video
         if len(video_modify) > 0:
-            logger.info("Editing video...")
+            logger.info(f"Editing video {video_id}...")
             cmd = f"ffmpeg -i {modified_video_path} -filter_complex \"[0:v]"
             sigma_dict = {
                 'low': 5,
@@ -166,7 +166,7 @@ def edit_video_aligned():
             modified_video_tmp.unlink()
         # edit audio
         if len(audio_modify) > 0:
-            logger.info("Editing audio...")
+            logger.info(f"Editing audio {video_id}...")
             cmd = f"ffmpeg -i {modified_video_path} -filter_complex \"[0:a]"
             for i, a in enumerate(audio_modify):
                 word_id = a[0]
@@ -183,7 +183,7 @@ def edit_video_aligned():
             modified_video_tmp.unlink()
         # add noise
         if len(noise) > 0:
-            logger.info("Adding noise...")
+            logger.info(f"Adding noise for {video_id}...")
             cmd = f"ffmpeg -i {modified_video_path} "
             for i in range(len(noise)):
                 noise_path = Path(__file__).parent / "assets" / "noise" / f"{noise[i][6:]}.wav"
@@ -235,7 +235,8 @@ def run_msa_aligned():
         weights_root_path = Path(__file__).parent / "assets" / "weights"
         # init
         cfg = get_default_config('bert+opensmile+openface')
-        cfg['text']['device'] = 'cuda:3'
+        cfg['text']['device'] = DEVICE
+        cfg['align']['device'] = DEVICE
         cfg['video']['fps'] = 30
         cfg['video']['args'] = {
             "hogalign": False,
@@ -249,20 +250,20 @@ def run_msa_aligned():
             "gaze": False,
             "tracked": False
         }
-        fet = FeatureExtractionTool(cfg)
+        fet = FeatureExtractionTool(cfg, verbose=0)
         bert_tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
         # data defence
-        logger.info("Data-Level Defence...")
+        logger.info(f"Data-Level Defence for {video_id}...")
         data_defended = data_defence(video_id, defence)
         # extract original features
-        logger.info("Extracting features from original video...")
+        logger.info(f"Extracting features from original video {video_id}...")
         f_original = fet.run_single(video_original_path, feat_original_path, text_file=trans_original_path)
         # extract modified features
-        logger.info("Extracting features from modified video...")
+        logger.info(f"Extracting features from modified video {video_id}...")
         f_modified = fet.run_single(video_modified_path, feat_modified_path, text_file=trans_modified_path)
         # extract defended features
         if data_defended:
-            logger.info("Extracting features from defended video...")
+            logger.info(f"Extracting features from defended video {video_id}...")
             fet.run_single(video_defended_path, feat_defended_path, text_file=trans_modified_path)
         # explain original features
         word_ids_original = get_word_ids(trans_original_path, bert_tokenizer)
@@ -280,7 +281,7 @@ def run_msa_aligned():
         # explain modified & defended features
         word_ids_modified = get_word_ids(trans_modified_path, bert_tokenizer)
         # feature defence
-        logger.info("Feature-Level Defence...")
+        logger.info(f"Feature-Level Defence for {video_id}...")
         feature_defended = feature_defence(video_id, defence, data_defended, word_ids_modified)
         last_word_id = -1
         remove_ids = []
@@ -393,7 +394,7 @@ def run_msa_aligned():
                 "AU45_r": f_defended['vision'][:, -19].tolist(),
             }
         # run MSA models
-        logger.info("Running MSA models...")
+        logger.info(f"Running MSA models for {video_id}...")
         res = {
             "original": {},
             "modified": {},
@@ -406,12 +407,12 @@ def run_msa_aligned():
             pad_or_truncate(feat_defended_path, 75)
         for m in models:
             config = get_msa_config(m)
-            r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_original_path, gpu_id=3)
+            r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_original_path, gpu_id=-1)
             res["original"][m] = float(r)
-            r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_modified_path, gpu_id=3)
+            r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_modified_path, gpu_id=-1)
             res["modified"][m] = float(r)
             if data_defended or feature_defended:
-                r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_defended_path, gpu_id=3)
+                r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_defended_path, gpu_id=-1)
                 res["defended"][m] = float(r)
 
     except Exception as e:

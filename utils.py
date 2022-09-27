@@ -289,7 +289,7 @@ def get_msa_config(model_name : str) -> dict:
                 'weight_decay': 0.002, 
             })
         case 'mult':
-            config.update({})
+            pass
         case 'mmim':
             config.update({
                 'need_data_aligned': True,
