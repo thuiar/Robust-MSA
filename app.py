@@ -406,15 +406,164 @@ def run_msa_aligned():
         if data_defended or feature_defended:
             pad_or_truncate(feat_defended_path, 75)
         for m in models:
-            config = get_msa_config(m)
-            r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_original_path, gpu_id=-1)
-            res["original"][m] = float(r)
-            r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_modified_path, gpu_id=-1)
-            res["modified"][m] = float(r)
-            if data_defended or feature_defended:
-                r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_defended_path, gpu_id=-1)
-                res["defended"][m] = float(r)
+            if m == "naat": # not integrated into MMSA yet
+                from naat.v2 import v2
+                from easydict import EasyDict as edict
+                config_naat = {
+                    'need_data_aligned': True,
+                    'early_stop': 8,
+                    'need_normalized': False,
+                    # use finetune for bert
+                    'use_bert': True,
+                    # module structure selection.
+                    'fusion': 'structure_one',
+                    'reconstruction': 'structure_one',
+                    'discriminator': 'structure_one',
+                    'classifier': 'structure_one',
+                        
+                    # temporal convolution kernel size
+                    'fus_d_l': 128,
+                    'fus_d_a': 16,
+                    'fus_d_v': 32,
 
+                    'fus_conv1d_kernel_l': 3,
+                    'fus_conv1d_kernel_a': 5,
+                    'fus_conv1d_kernel_v': 3,
+
+                    'fus_nheads': 2,
+                    'fus_layers': 1,
+                    'fus_attn_mask': True,
+                    'fus_position_embedding': False,
+                    'fus_relu_dropout': 0.2,
+                    'fus_embed_dropout': 0.2,
+                    'fus_res_dropout': 0.2,
+                    'fus_attn_dropout': 0.2,
+
+                    'rec_hidden_dim1': 64,
+                    'rec_dropout': 0.2,
+                    'rec_hidden_dim2': 32,
+
+                    'disc_hidden_dim1': 64,
+                    'disc_hidden_dim2': 32,
+
+                    'clf_dropout': 0.2,
+                    'clf_hidden_dim': 32,
+                    
+                    # train hyperparameter.
+                    'alpha': 0.5,
+                    'batch_size': 32,
+                    'beta': 1.0,
+                    # 当 fine_tune 为 False 时使用。
+                    'learning_rate': 0.002,
+                    'decay': 1e-05,
+                    # 当 fine_tune 为 True 时使用。
+                    'learning_rate_bert': 1e-05,
+                    'learning_rate_other': 0.002,
+                    'weight_decay_bert': 0.0,
+                    'weight_decay_other': 0.0005,
+
+                    'grad_clip': 1.0,
+                }
+                state_dict = torch.load("/home/sharing/lyh/acmmm_sub/results/save_models/normals/v2-mosei_fet-method_one-1111.pth")
+                from collections import OrderedDict
+                new_state_dict = OrderedDict([(k[6:], v) for k, v in state_dict.items()])
+                # run on original feature
+                with open(feat_original_path, 'rb') as f:
+                    feature = pickle.load(f)
+                config_naat['feature_dims'] = [feature['text'].shape[1], feature['audio'].shape[1], feature['vision'].shape[1]]
+                config_naat['seq_lens'] = [feature['text'].shape[0], feature['audio'].shape[0], feature['vision'].shape[0]]
+                if config_naat.get('use_bert', None):
+                    if type(text := feature['text_bert']) == np.ndarray:
+                        text = torch.from_numpy(text).float()
+                else:
+                    if type(text := feature['text']) == np.ndarray:
+                        text = torch.from_numpy(text).float()
+                if type(audio := feature['audio']) == np.ndarray:
+                    audio = torch.from_numpy(audio).float()
+                if type(vision := feature['vision']) == np.ndarray:
+                    vision = torch.from_numpy(vision).float()
+                text = text.unsqueeze(0)
+                audio = audio.unsqueeze(0)
+                vision = vision.unsqueeze(0)
+                config_naat = edict(config_naat)
+                model_naat = v2(config_naat)
+                # load model
+                model_naat.load_state_dict(new_state_dict)
+                model_naat.eval()
+                with torch.no_grad():
+                    fusion_feature = model_naat.fusion(text, audio, vision)
+                    output = model_naat.classifier(fusion_feature)
+                    if type(output) == dict:
+                        output = output['M']
+                    res["original"][m] = float(output.detach().numpy()[0][0])
+                # run on modified feature
+                with open(feat_modified_path, 'rb') as f:
+                    feature = pickle.load(f)
+                config_naat['feature_dims'] = [feature['text'].shape[1], feature['audio'].shape[1], feature['vision'].shape[1]]
+                config_naat['seq_lens'] = [feature['text'].shape[0], feature['audio'].shape[0], feature['vision'].shape[0]]
+                if config_naat.get('use_bert', None):
+                    if type(text := feature['text_bert']) == np.ndarray:
+                        text = torch.from_numpy(text).float()
+                else:
+                    if type(text := feature['text']) == np.ndarray:
+                        text = torch.from_numpy(text).float()
+                if type(audio := feature['audio']) == np.ndarray:
+                    audio = torch.from_numpy(audio).float()
+                if type(vision := feature['vision']) == np.ndarray:
+                    vision = torch.from_numpy(vision).float()
+                text = text.unsqueeze(0)
+                audio = audio.unsqueeze(0)
+                vision = vision.unsqueeze(0)
+                config_naat = edict(config_naat)
+                model_naat = v2(config_naat)
+                # load model
+                model_naat.load_state_dict(new_state_dict)
+                model_naat.eval()
+                with torch.no_grad():
+                    fusion_feature = model_naat.fusion(text, audio, vision)
+                    output = model_naat.classifier(fusion_feature)
+                    if type(output) == dict:
+                        output = output['M']
+                    res["modified"][m] = float(output.detach().numpy()[0][0])
+                # run on defended feature
+                if data_defended or feature_defended:
+                    with open(feat_modified_path, 'rb') as f:
+                        feature = pickle.load(f)
+                    config_naat['feature_dims'] = [feature['text'].shape[1], feature['audio'].shape[1], feature['vision'].shape[1]]
+                    config_naat['seq_lens'] = [feature['text'].shape[0], feature['audio'].shape[0], feature['vision'].shape[0]]
+                    if config_naat.get('use_bert', None):
+                        if type(text := feature['text_bert']) == np.ndarray:
+                            text = torch.from_numpy(text).float()
+                    else:
+                        if type(text := feature['text']) == np.ndarray:
+                            text = torch.from_numpy(text).float()
+                    if type(audio := feature['audio']) == np.ndarray:
+                        audio = torch.from_numpy(audio).float()
+                    if type(vision := feature['vision']) == np.ndarray:
+                        vision = torch.from_numpy(vision).float()
+                    text = text.unsqueeze(0)
+                    audio = audio.unsqueeze(0)
+                    vision = vision.unsqueeze(0)
+                    config_naat = edict(config_naat)
+                    model_naat = v2(config_naat)
+                    # load model
+                    model_naat.load_state_dict(new_state_dict)
+                    model_naat.eval()
+                    with torch.no_grad():
+                        fusion_feature = model_naat.fusion(text, audio, vision)
+                        output = model_naat.classifier(fusion_feature)
+                        if type(output) == dict:
+                            output = output['M']
+                        res["defended"][m] = float(output.detach().numpy()[0][0])
+            else:
+                config = get_msa_config(m)
+                r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_original_path, gpu_id=-1)
+                res["original"][m] = float(r)
+                r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_modified_path, gpu_id=-1)
+                res["modified"][m] = float(r)
+                if data_defended or feature_defended:
+                    r = MMSA_test(config, weights_root_path / f"{m}-mosei.pth", feat_defended_path, gpu_id=-1)
+                    res["defended"][m] = float(r)
     except Exception as e:
         logger.exception(e)
         return {"code": ERROR_CODE, "msg": str(e)}

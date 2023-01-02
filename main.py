@@ -32,7 +32,7 @@ if __name__ == "__main__":
         # app.run(host='0.0.0.0', port=WEB_SERVER_PORT)
     except KeyboardInterrupt:
         logger.info("Stopping WSGI Server...")
-        clear_media_folder()
+        # clear_media_folder()
         web_server.stop()
         logger.info("WSGI Server stopped.")
         logger.info("========================= Program Stopped =========================")

@@ -8,13 +8,22 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from shutil import rmtree
 
-import ctc_segmentation
 import librosa
 import numpy as np
 import torch
 from MMSA import get_config_regression
 from transformers import (BertTokenizerFast, Wav2Vec2ForCTC, Wav2Vec2Processor,
                           Wav2Vec2CTCTokenizer)
+from ctc_segmentation import (
+    CtcSegmentationParameters,
+    ctc_segmentation,
+    determine_utterance_segments,
+    prepare_token_list,
+)
+from espnet2.bin.asr_align import CTCSegmentation
+from espnet2.bin.asr_inference import Speech2Text
+from espnet_model_zoo.downloader import ModelDownloader
+from espnet2.tasks.asr import ASRTask
 
 from config import *
 
@@ -62,16 +71,18 @@ def execute_cmd(cmd: str) -> bytes:
         raise RuntimeError("ffmpeg", out, err)
     return out
 
+@torch.no_grad()
 def do_asr(
     audio_file : str | Path, 
 ) -> str:
     try:
+        sample_rate = 16000
+        speech, _ = librosa.load(audio_file, sr=sample_rate)
         processor = Wav2Vec2Processor.from_pretrained(WAV2VEC_MODEL_NAME)
         model = Wav2Vec2ForCTC.from_pretrained(WAV2VEC_MODEL_NAME).to(DEVICE)
-        sample_rate = 16000
-        audio, _ = librosa.load(audio_file, sr=sample_rate)
+        
         features = processor(
-            audio, 
+            speech, 
             sampling_rate=sample_rate,
             return_tensors="pt", 
             padding="longest"
@@ -81,21 +92,36 @@ def do_asr(
 
         predicted_ids = torch.argmax(logits, dim=-1)
         asr_text = processor.decode(predicted_ids)
+        
+        # sample_rate = 16000
+        # speech, _ = librosa.load(audio_file, sr=sample_rate)
+        # d = ModelDownloader(cachedir="/home/sharing/mhs/espnet_models")
+        # # model = d.download_and_unpack("espnet/simpleoier_librispeech_asr_train_asr_conformer7_hubert_ll60k_large_raw_en_bpe5000_sp")
+        # model = d.download_and_unpack("espnet/pengcheng_guo_wenetspeech_asr_train_asr_raw_zh_char")
+
+        # model_infer = Speech2Text(
+        #     asr_train_config = model["asr_train_config"],
+        #     asr_model_file = model["asr_model_file"],
+        #     device = "cpu",
+        # )
+        # asr_text, *_ = model_infer(speech.squeeze())[0]
+
         return asr_text
     except Exception as e:
         raise e
 
+@torch.no_grad()
 def do_alignment(
     audio_file : str | Path, 
     transcript : str,
 ) -> list[dict]:
     try:
+        speech, _ = librosa.load(audio_file, sr=16000)
         processor = Wav2Vec2Processor.from_pretrained(WAV2VEC_MODEL_NAME)
         model = Wav2Vec2ForCTC.from_pretrained(WAV2VEC_MODEL_NAME).to(DEVICE)
         tokenizer = Wav2Vec2CTCTokenizer.from_pretrained(WAV2VEC_MODEL_NAME)
-        audio, _ = librosa.load(audio_file, sr=16000)
         features = processor(
-            audio, 
+            speech, 
             sampling_rate=16000, 
             return_tensors="pt", 
             padding="longest"
@@ -118,13 +144,59 @@ def do_alignment(
         
         # Do align
         char_list = [inv_vocab[i] for i in range(len(inv_vocab))]
-        config = ctc_segmentation.CtcSegmentationParameters(char_list=char_list)
-        config.index_duration = audio.shape[0] / probs.size()[0] / 16000
+        config = CtcSegmentationParameters(char_list=char_list)
+        config.index_duration = speech.shape[0] / probs.size()[0] / 16000
         
-        ground_truth_mat, utt_begin_indices = ctc_segmentation.prepare_token_list(config, tokens)
-        timings, char_probs, state_list = ctc_segmentation.ctc_segmentation(config, probs.numpy(), ground_truth_mat)
-        segments = ctc_segmentation.determine_utterance_segments(config, utt_begin_indices, char_probs, timings, transcripts)
+        ground_truth_mat, utt_begin_indices = prepare_token_list(config, tokens)
+        timings, char_probs, state_list = ctc_segmentation(config, probs.numpy(), ground_truth_mat)
+        segments = determine_utterance_segments(config, utt_begin_indices, char_probs, timings, transcripts)
         return [{"text" : t, "start" : p[0], "end" : p[1], "conf" : np.exp(p[2])} for t,p in zip(transcripts, segments)]
+
+        # speech, _ = librosa.load(audio_file, sr=16000)
+        # d = ModelDownloader(cachedir="/home/sharing/mhs/espnet_models")
+        # # model = d.download_and_unpack("espnet/simpleoier_librispeech_asr_train_asr_conformer7_hubert_ll60k_large_raw_en_bpe5000_sp")
+        # model = d.download_and_unpack("espnet/pengcheng_guo_wenetspeech_asr_train_asr_raw_zh_char")
+        # asr_model, asr_train_args = ASRTask.build_model_from_file(
+        #     config_file = model["asr_train_config"],
+        #     model_file = model["asr_model_file"],
+        #     device = "cpu",
+        # )
+        # speech = torch.tensor(speech).unsqueeze(0).to("cpu")
+        # lengths = torch.tensor(speech.shape[1]).unsqueeze(0).to("cpu")
+        # enc, _ = asr_model.encode(speech=speech, speech_lengths=lengths)
+        # probs = asr_model.ctc.log_softmax(enc).detach().squeeze(0).cpu()
+
+        # char_list = asr_model.token_list[:-1]
+        # index_duration = speech.shape[1] / probs.shape[0] / 16000
+        # config = CtcSegmentationParameters(
+        #     char_list=char_list,
+        #     index_duration=index_duration,
+        #     # replace_spaces_with_blanks=True,
+        #     # blank_transition_cost_zero=True,
+        #     # preamble_transition_cost_zero=False,
+        # )
+        # tokens = []
+        # unk = char_list.index("<unk>")
+        # for ch in transcript:
+        #     token_id = char_list.index(ch)
+        #     token_id = np.array(token_id)
+        #     tokens.append(token_id[token_id != unk])
+
+        # ground_truth_mat, utt_begin_indices = prepare_token_list(config, tokens)
+        # timings, char_probs, state_list = ctc_segmentation(config, probs.numpy(), ground_truth_mat)
+        # segments = determine_utterance_segments(config, utt_begin_indices, char_probs, timings, transcript)
+
+        # res = []
+        # for i,(t,p) in enumerate(zip(transcript, segments)):
+        #     # add 0.11s offset to end timings of chinese characters
+        #     res.append({
+        #         "text" : t, 
+        #         "start" : p[0] if i == 0 else p[0] + 0.11, 
+        #         "end" : min(p[1] + 0.11, speech.shape[1]/16000), 
+        #         "conf" : np.exp(p[2])
+        #     })
+        # print(res)
+        # return res
     except Exception as e:
         raise e
 
