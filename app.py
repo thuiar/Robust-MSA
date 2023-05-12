@@ -194,7 +194,7 @@ def edit_video_aligned():
             cmd += "[0a]"
             for i in range(len(noise)):
                 cmd += f"[{i+1}a]"
-            cmd += f"amix=inputs={len(noise)+1}:duration=shortest:weights='1 {' '.join(volume)}':dropout_transition=0:normalize=0[aout]\" -map 0:v -map \"[aout]\" -c:v copy -y {modified_video_tmp}"
+            cmd += f"amix=inputs={len(noise)+1}:duration=first:weights='1 {' '.join(volume)}':dropout_transition=0[aout]\" -map 0:v -map \"[aout]\" -c:v copy -y {modified_video_tmp}"
             logger.debug(cmd)
             execute_cmd(cmd)
             shutil.copyfile(modified_video_tmp, modified_video_path)
@@ -234,7 +234,7 @@ def run_msa_aligned():
         trans_modified_path = MEDIA_PATH / video_id / "transcript_modified.txt"
         weights_root_path = Path(__file__).parent / "assets" / "weights"
         # init
-        cfg = get_default_config('bert+opensmile+openface')
+        cfg = get_default_config('aligned')
         cfg['text']['device'] = DEVICE
         cfg['align']['device'] = DEVICE
         cfg['video']['fps'] = 30
@@ -406,10 +406,10 @@ def run_msa_aligned():
         if data_defended or feature_defended:
             pad_or_truncate(feat_defended_path, 75)
         for m in models:
-            if m == "naat": # not integrated into MMSA yet
-                from naat.v2 import v2
+            if m == "niat": # not integrated into MMSA yet
+                from niat.v2 import v2
                 from easydict import EasyDict as edict
-                config_naat = {
+                config_niat = {
                     'need_data_aligned': True,
                     'early_stop': 8,
                     'need_normalized': False,
@@ -464,15 +464,15 @@ def run_msa_aligned():
 
                     'grad_clip': 1.0,
                 }
-                state_dict = torch.load("/home/sharing/lyh/acmmm_sub/results/save_models/normals/v2-mosei_fet-method_one-1111.pth")
+                state_dict = torch.load(Path(__file__).parent / "assets" / "weights" / "niat-mosei.pth")
                 from collections import OrderedDict
                 new_state_dict = OrderedDict([(k[6:], v) for k, v in state_dict.items()])
                 # run on original feature
                 with open(feat_original_path, 'rb') as f:
                     feature = pickle.load(f)
-                config_naat['feature_dims'] = [feature['text'].shape[1], feature['audio'].shape[1], feature['vision'].shape[1]]
-                config_naat['seq_lens'] = [feature['text'].shape[0], feature['audio'].shape[0], feature['vision'].shape[0]]
-                if config_naat.get('use_bert', None):
+                config_niat['feature_dims'] = [feature['text'].shape[1], feature['audio'].shape[1], feature['vision'].shape[1]]
+                config_niat['seq_lens'] = [feature['text'].shape[0], feature['audio'].shape[0], feature['vision'].shape[0]]
+                if config_niat.get('use_bert', None):
                     if type(text := feature['text_bert']) == np.ndarray:
                         text = torch.from_numpy(text).float()
                 else:
@@ -485,23 +485,23 @@ def run_msa_aligned():
                 text = text.unsqueeze(0)
                 audio = audio.unsqueeze(0)
                 vision = vision.unsqueeze(0)
-                config_naat = edict(config_naat)
-                model_naat = v2(config_naat)
+                config_niat = edict(config_niat)
+                model_niat = v2(config_niat)
                 # load model
-                model_naat.load_state_dict(new_state_dict)
-                model_naat.eval()
+                model_niat.load_state_dict(new_state_dict)
+                model_niat.eval()
                 with torch.no_grad():
-                    fusion_feature = model_naat.fusion(text, audio, vision)
-                    output = model_naat.classifier(fusion_feature)
+                    fusion_feature = model_niat.fusion(text, audio, vision)
+                    output = model_niat.classifier(fusion_feature)
                     if type(output) == dict:
                         output = output['M']
                     res["original"][m] = float(output.detach().numpy()[0][0])
                 # run on modified feature
                 with open(feat_modified_path, 'rb') as f:
                     feature = pickle.load(f)
-                config_naat['feature_dims'] = [feature['text'].shape[1], feature['audio'].shape[1], feature['vision'].shape[1]]
-                config_naat['seq_lens'] = [feature['text'].shape[0], feature['audio'].shape[0], feature['vision'].shape[0]]
-                if config_naat.get('use_bert', None):
+                config_niat['feature_dims'] = [feature['text'].shape[1], feature['audio'].shape[1], feature['vision'].shape[1]]
+                config_niat['seq_lens'] = [feature['text'].shape[0], feature['audio'].shape[0], feature['vision'].shape[0]]
+                if config_niat.get('use_bert', None):
                     if type(text := feature['text_bert']) == np.ndarray:
                         text = torch.from_numpy(text).float()
                 else:
@@ -514,14 +514,14 @@ def run_msa_aligned():
                 text = text.unsqueeze(0)
                 audio = audio.unsqueeze(0)
                 vision = vision.unsqueeze(0)
-                config_naat = edict(config_naat)
-                model_naat = v2(config_naat)
+                config_niat = edict(config_niat)
+                model_niat = v2(config_niat)
                 # load model
-                model_naat.load_state_dict(new_state_dict)
-                model_naat.eval()
+                model_niat.load_state_dict(new_state_dict)
+                model_niat.eval()
                 with torch.no_grad():
-                    fusion_feature = model_naat.fusion(text, audio, vision)
-                    output = model_naat.classifier(fusion_feature)
+                    fusion_feature = model_niat.fusion(text, audio, vision)
+                    output = model_niat.classifier(fusion_feature)
                     if type(output) == dict:
                         output = output['M']
                     res["modified"][m] = float(output.detach().numpy()[0][0])
@@ -529,9 +529,9 @@ def run_msa_aligned():
                 if data_defended or feature_defended:
                     with open(feat_modified_path, 'rb') as f:
                         feature = pickle.load(f)
-                    config_naat['feature_dims'] = [feature['text'].shape[1], feature['audio'].shape[1], feature['vision'].shape[1]]
-                    config_naat['seq_lens'] = [feature['text'].shape[0], feature['audio'].shape[0], feature['vision'].shape[0]]
-                    if config_naat.get('use_bert', None):
+                    config_niat['feature_dims'] = [feature['text'].shape[1], feature['audio'].shape[1], feature['vision'].shape[1]]
+                    config_niat['seq_lens'] = [feature['text'].shape[0], feature['audio'].shape[0], feature['vision'].shape[0]]
+                    if config_niat.get('use_bert', None):
                         if type(text := feature['text_bert']) == np.ndarray:
                             text = torch.from_numpy(text).float()
                     else:
@@ -544,14 +544,14 @@ def run_msa_aligned():
                     text = text.unsqueeze(0)
                     audio = audio.unsqueeze(0)
                     vision = vision.unsqueeze(0)
-                    config_naat = edict(config_naat)
-                    model_naat = v2(config_naat)
+                    config_niat = edict(config_niat)
+                    model_niat = v2(config_niat)
                     # load model
-                    model_naat.load_state_dict(new_state_dict)
-                    model_naat.eval()
+                    model_niat.load_state_dict(new_state_dict)
+                    model_niat.eval()
                     with torch.no_grad():
-                        fusion_feature = model_naat.fusion(text, audio, vision)
-                        output = model_naat.classifier(fusion_feature)
+                        fusion_feature = model_niat.fusion(text, audio, vision)
+                        output = model_niat.classifier(fusion_feature)
                         if type(output) == dict:
                             output = output['M']
                         res["defended"][m] = float(output.detach().numpy()[0][0])
